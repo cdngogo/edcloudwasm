@@ -343,35 +343,46 @@ const establishTcpConnection = async (parsedRequest, request) => {
     return null;
 };
 const manualPipe = async (readable, writable) => {
-    const _bufferSize = bufferSize, _maxChunkLen = maxChunkLen, _startThreshold = startThreshold, _flushTime = flushTime, _safeBufferSize = _bufferSize - _maxChunkLen;
-    let mainBuf = new ArrayBuffer(_bufferSize), offset = 0, timerId = null, resume = null, isReading = false, needsFlush = false, totalBytes = 0;
-    const flush = () => {
-        if (isReading) return needsFlush = true;
-        offset > 0 && (writable.send(mainBuf.slice(0, offset)), offset = 0);
-        needsFlush = false, timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
+    const safeBufferSize = bufferSize - maxChunkLen;
+    let buffer = new Uint8Array(bufferSize), chunkBuf = new ArrayBuffer(maxChunkLen);
+    let offset = 0, totalBytes = 0, timerId = null, resume = null;
+    let avgChunkLen = 4096, stats = [], statBytes = 0;
+    const flushBuffer = () => {
+        offset > 0 && (writable.send(buffer.slice(0, offset)), offset = 0);
+        timerId && (clearTimeout(timerId), timerId = null);
+        resume?.(), resume = null;
     };
     const reader = readable.getReader({mode: 'byob'});
     try {
         while (true) {
-            isReading = true;
-            const {done, value} = await reader.read(new Uint8Array(mainBuf, offset, _maxChunkLen));
-            if (isReading = false, done) break;
-            mainBuf = value.buffer;
+            const {done, value} = await reader.read(new Uint8Array(chunkBuf));
+            if (done) break;
+            chunkBuf = value.buffer;
             const chunkLen = value.byteLength;
-            if (chunkLen < _maxChunkLen) {
-                chunkLen < 4096 && (totalBytes = 0);
-                offset > 0 ? (offset += chunkLen, flush()) : writable.send(value.slice());
+            const now = Date.now();
+            stats.push([now, chunkLen]);
+            statBytes += chunkLen;
+            while (stats.length && now - stats[0][0] > 1000) {
+                statBytes -= stats.shift()[1];
+            }
+            avgChunkLen = statBytes / stats.length || 4096;
+            if (chunkLen < 512) {
+                flushBuffer();
+                writable.send(value.slice());
             } else {
-                offset += chunkLen, totalBytes += chunkLen, needsFlush && flush();
-                if (totalBytes < _startThreshold) {
-                    offset > _safeBufferSize && flush();
+                chunkLen < avgChunkLen * 0.9 && chunkLen < 24576 && (totalBytes = 0);
+                buffer.set(value, offset);
+                offset += chunkLen;
+                totalBytes += chunkLen;
+                timerId ||= setTimeout(flushBuffer, flushTime);
+                if (totalBytes < startThreshold) {
+                    offset > safeBufferSize && flushBuffer();
                 } else {
-                    timerId ||= setTimeout(flush, _flushTime);
-                    offset > _safeBufferSize && (await new Promise(r => resume = r));
+                    offset > safeBufferSize && (await new Promise(r => resume = r));
                 }
             }
         }
-    } finally {isReading = false, flush(), reader.releaseLock()}
+    } finally {flushBuffer(), reader.releaseLock()}
 };
 const handleSession = async (chunk, state, request, writable, close) => {
     state.needMore = false;
